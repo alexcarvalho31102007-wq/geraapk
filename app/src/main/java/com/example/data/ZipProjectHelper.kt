@@ -27,7 +27,6 @@ object ZipProjectHelper {
         var xmlCount = 0
         var gradleCount = 0
         var hasGradleWrapper = false
-        var hasManifestOrGradle = false
         var detectedPackage = "com.android.app"
         var detectedAppName = fileName.removeSuffix(".zip").replace("-", " ").replace("_", " ")
             .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
@@ -38,24 +37,24 @@ object ZipProjectHelper {
         ZipInputStream(ByteArrayInputStream(sanitizedBytes)).use { zis ->
             var entry: ZipEntry? = zis.nextEntry
             while (entry != null) {
-                val name = entry.name
+                val name = entry.name.replace('\\', '/')
+                val lowerName = name.lowercase()
                 if (!entry.isDirectory) {
                     totalFiles++
                     if (entryPaths.size < 45) {
                         entryPaths.add(name)
                     }
                     when {
-                        name.endsWith(".kt") -> kotlinCount++
-                        name.endsWith(".java") -> javaCount++
-                        name.endsWith(".xml") -> xmlCount++
-                        name.endsWith(".gradle") || name.endsWith(".gradle.kts") || name.endsWith(".toml") -> gradleCount++
+                        lowerName.endsWith(".kt") -> kotlinCount++
+                        lowerName.endsWith(".java") -> javaCount++
+                        lowerName.endsWith(".xml") -> xmlCount++
+                        lowerName.endsWith(".gradle") || lowerName.endsWith(".gradle.kts") || lowerName.endsWith(".toml") -> gradleCount++
                     }
-                    if (name.endsWith("gradlew") || name.contains("gradle-wrapper.properties")) {
+                    if (lowerName.endsWith("gradlew") || lowerName.contains("gradle-wrapper.properties")) {
                         hasGradleWrapper = true
                     }
 
-                    if (name.endsWith("build.gradle.kts") || name.endsWith("build.gradle") || name.endsWith("AndroidManifest.xml")) {
-                        hasManifestOrGradle = true
+                    if (lowerName.endsWith("build.gradle.kts") || lowerName.endsWith("build.gradle") || lowerName.endsWith("androidmanifest.xml")) {
                         val content = readSmallTextEntry(zis)
                         val pkgMatch = Regex("""(?:applicationId|namespace|package)\s*[=:]?\s*["']([a-zA-Z0-9_.]+)["']""")
                             .find(content)
@@ -70,7 +69,7 @@ object ZipProjectHelper {
                         if (targetSdkMatch != null) {
                             targetSdk = targetSdkMatch.groupValues[1].toIntOrNull() ?: 35
                         }
-                    } else if (name.endsWith("strings.xml")) {
+                    } else if (lowerName.endsWith("strings.xml")) {
                         val content = readSmallTextEntry(zis)
                         val appNameMatch = Regex("""<string\s+name="app_name">([^<]+)</string>""").find(content)
                         if (appNameMatch != null) {
@@ -84,13 +83,7 @@ object ZipProjectHelper {
         }
 
         if (totalFiles == 0) {
-            throw IllegalArgumentException("O arquivo selecionado não é um arquivo ZIP válido ou está vazio.")
-        }
-
-        if (!hasManifestOrGradle) {
-            throw IllegalArgumentException(
-                "Projeto Android incompatível ou incompleto: nenhum arquivo AndroidManifest.xml ou build.gradle(.kts) encontrado no ZIP."
-            )
+            throw IllegalArgumentException("O arquivo selecionado está vazio ou não é um arquivo ZIP válido.")
         }
 
         val workflowYaml = buildGitHubActionsWorkflowYaml(detectedAppName)
@@ -116,10 +109,9 @@ object ZipProjectHelper {
 
     /**
      * Gera o workflow único de compilação EXCLUSIVAMENTE em modo Release (`assembleRelease`).
-     * - Nunca executa `assembleDebug`.
-     * - Remove qualquer workflow adicional que porventura tenha sido descompactado no runner.
-     * - Gera keystore de Release e assina automaticamente o APK final (`apksigner` / `signingConfig`)
-     *   para que o APK Release esteja 100% pronto para instalação e distribuição.
+     * - Suporta tanto envio de árvore de arquivos quanto arquivo compactado (`uploads/project.zip`).
+     * - Remove qualquer workflow extra descompactado no runner para garantir execução única.
+     * - Assina o APK Release com `apksigner` / `my-upload-key.jks` pronto para instalação.
      */
     fun buildGitHubActionsWorkflowYaml(appName: String): String {
         val cleanTitle = appName.replace(Regex("""["'\r\n]"""), "").trim().ifEmpty { "Projeto Android" }
@@ -154,14 +146,15 @@ jobs:
 
       - name: Preparar Ambiente e Assinatura Release
         run: |
-          if [ -f "uploads/project.zip" ] && [ ! -f "settings.gradle.kts" ] && [ ! -f "settings.gradle" ]; then
-            unzip -o uploads/project.zip -d .
+          if [ -f "uploads/project.zip" ]; then
+            unzip -o -q uploads/project.zip -d .
+            rm -f uploads/project.zip
           fi
-          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
-            SUBDIR=${'$'}(find . -maxdepth 2 -name "settings.gradle*" -printf "%h\n" | head -n 1)
+          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+            SUBDIR=${'$'}(find . -maxdepth 3 \( -name "settings.gradle*" -o -name "build.gradle*" \) -printf "%h\n" | head -n 1)
             if [ -n "${'$'}SUBDIR" ] && [ "${'$'}SUBDIR" != "." ]; then
               shopt -s dotglob
-              mv "${'$'}SUBDIR"/* . || true
+              cp -rf "${'$'}SUBDIR"/* . 2>/dev/null || true
             fi
           fi
           # Remove qualquer workflow extra descompactado para garantir execução única
@@ -179,8 +172,12 @@ jobs:
           if [ ! -f ".env.example" ]; then
             echo "GEMINI_API_KEY=PLACEHOLDER" > .env.example
           fi
+          rm -f local.properties
           if [ ! -f "my-upload-key.jks" ]; then
             keytool -genkeypair -v -keystore my-upload-key.jks -storepass "geraapkrelease2026" -alias upload -keypass "geraapkrelease2026" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=GERA APK Release,O=GERA APK,C=BR"
+          fi
+          if [ ! -f "debug.keystore" ]; then
+            cp my-upload-key.jks debug.keystore || true
           fi
 
       - name: Configurar JDK 21
@@ -197,7 +194,7 @@ jobs:
 
       - name: Compilar Aplicativo (assembleRelease)
         run: |
-          gradle assembleRelease --parallel --build-cache --configuration-cache -x lint -x lintVitalRelease -x test
+          gradle assembleRelease --parallel --build-cache -x lint -x lintVitalRelease -x test
 
       - name: Assinar e Preparar APK Release Final
         run: |

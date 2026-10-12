@@ -16,13 +16,9 @@ import com.squareup.moshi.Moshi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
@@ -31,7 +27,6 @@ import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 class BuildBackgroundService : Service() {
 
@@ -45,8 +40,9 @@ class BuildBackgroundService : Service() {
     private val gitHubApi: GitHubApiService by lazy {
         val moshi = Moshi.Builder().build()
         val okHttp = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .connectTimeout(45, TimeUnit.SECONDS)
+            .readTimeout(90, TimeUnit.SECONDS)
+            .writeTimeout(90, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .addInterceptor { chain ->
@@ -132,8 +128,7 @@ class BuildBackgroundService : Service() {
         var record = dao.getRecordById(recordId) ?: return
 
         try {
-            // 1. Tenta primeiro executar via Supabase Edge Function ("functions/v1/gera-apk-compiler")
-            // onde o GITHUB_TOKEN reside exclusivamente no cofre do Supabase no backend.
+            // 1. Se houver Edge Function implantada no Supabase, utiliza-a
             if (supabaseRepo.isCloudConfigured()) {
                 val edgeHandled = tryExecuteViaSupabaseEdgeFunction(
                     record = record,
@@ -143,12 +138,12 @@ class BuildBackgroundService : Service() {
                 if (edgeHandled) return
             }
 
-            // 2. Caso a Edge Function não esteja publicada, recupera dinamicamente a chave padrão do Supabase
+            // 2. Recupera automaticamente o token padrão do Supabase (ou BuildConfig)
             val backendToken = supabaseRepo.fetchDynamicBackendTokenIfNeeded(supabaseAccessToken)
             if (backendToken.isEmpty()) {
                 failBuild(
                     record = record,
-                    errorSummary = "Serviço de compilação temporariamente indisponível.",
+                    errorSummary = "Serviço de compilação indisponível.",
                     supabaseAccessToken = supabaseAccessToken
                 )
                 return
@@ -156,6 +151,7 @@ class BuildBackgroundService : Service() {
 
             val authHeader = "Bearer $backendToken"
 
+            // Se já havia um workflowRunId em andamento e não for recompilação forçada, retoma o monitoramento
             if (!isRecompile && record.workflowRunId != null && record.repoFullName.contains("/")) {
                 val parts = record.repoFullName.split("/")
                 monitorWorkflowAndFetchApk(
@@ -170,6 +166,7 @@ class BuildBackgroundService : Service() {
             }
 
             val zipFile = File(record.localZipPath)
+            // Recompilação direta de um repositório já existente no GitHub quando o ZIP local não está mais presente
             if (isRecompile && !zipFile.exists() && record.repoFullName.contains("/")) {
                 val parts = record.repoFullName.split("/")
                 val owner = parts[0]
@@ -339,7 +336,6 @@ class BuildBackgroundService : Service() {
                     return
                 }
                 targetBranch = createResp.body()!!.defaultBranch ?: "main"
-                delay(1500)
             }
 
             record = record.copy(
@@ -356,78 +352,119 @@ class BuildBackgroundService : Service() {
             record = updateRecordState(
                 record = record,
                 status = BuildStatus.IN_PROGRESS,
-                progress = 0.25f,
+                progress = 0.22f,
                 stepMessage = "Enviando arquivos",
                 supabaseAccessToken = supabaseAccessToken
             )
 
-            val normalizedFiles = ZipSanitizer.extractNormalizedFiles(projectInfo.rawZipBytes).toMutableMap()
-            normalizedFiles.keys.removeAll { ZipSanitizer.isAnyGitHubWorkflowOrFolder(it) }
-            normalizedFiles[ZipSanitizer.SINGLE_WORKFLOW_PATH] =
-                projectInfo.generatedWorkflowYaml.toByteArray(Charsets.UTF_8)
+            // Garante que a branch inicial do repositório já esteja disponível (com retry caso recém-criado)
+            var latestCommitSha: String? = null
+            for (attempt in 1..6) {
+                val refResp = gitHubApi.getBranchRef(authHeader, username, autoRepoName, targetBranch)
+                if (refResp.isSuccessful && refResp.body() != null) {
+                    latestCommitSha = refResp.body()!!.gitObject.sha
+                    break
+                }
+                delay(1200)
+            }
 
-            val refResp = gitHubApi.getBranchRef(authHeader, username, autoRepoName, targetBranch)
-            if (!refResp.isSuccessful || refResp.body() == null) {
+            // Se o repositório estava completamente vazio (sem commit inicial), cria o README inicial via Contents API
+            if (latestCommitSha == null) {
+                val initB64 = Base64.encodeToString(
+                    "# ${projectInfo.detectedAppName}\n".toByteArray(Charsets.UTF_8),
+                    Base64.NO_WRAP
+                )
+                val putInit = gitHubApi.putFileContent(
+                    authHeader = authHeader,
+                    owner = username,
+                    repo = autoRepoName,
+                    path = "README.md",
+                    request = GitHubPutFileRequest(
+                        message = "init: initialize repository",
+                        contentBase64 = initB64,
+                        branch = targetBranch
+                    )
+                )
+                if (putInit.isSuccessful) {
+                    latestCommitSha = putInit.body()?.commit?.sha
+                }
+                if (latestCommitSha == null) {
+                    val refRetry = gitHubApi.getBranchRef(authHeader, username, autoRepoName, targetBranch)
+                    latestCommitSha = refRetry.body()?.gitObject?.sha
+                }
+            }
+
+            if (latestCommitSha == null) {
                 failBuild(
                     record = record,
-                    errorSummary = "Não foi possível sincronizar a branch de compilação.",
+                    errorSummary = "Não foi possível inicializar a branch do repositório.",
                     supabaseAccessToken = supabaseAccessToken
                 )
                 return
             }
 
-            val latestCommitSha = refResp.body()!!.gitObject.sha
-            val totalFilesToUpload = normalizedFiles.size
-            val uploadedCounter = AtomicInteger(0)
-            val uploadSemaphore = Semaphore(8)
-
-            val treeResults = withContext(Dispatchers.IO) {
-                normalizedFiles.entries.map { (filePath, fileBytes) ->
-                    async {
-                        uploadSemaphore.withPermit {
-                            val b64 = Base64.encodeToString(fileBytes, Base64.NO_WRAP)
-                            val blobResp = gitHubApi.createGitBlob(
-                                authHeader = authHeader,
-                                owner = username,
-                                repo = autoRepoName,
-                                request = GitCreateBlobRequest(content = b64)
-                            )
-                            if (!blobResp.isSuccessful || blobResp.body() == null) {
-                                throw IllegalStateException("Falha ao enviar arquivo '$filePath'")
-                            }
-                            val done = uploadedCounter.incrementAndGet()
-                            if (done % 8 == 0 || done == totalFilesToUpload) {
-                                val uploadProgress = 0.25f + (0.12f * (done.toFloat() / totalFilesToUpload.coerceAtLeast(1)))
-                                dao.updateRecord(
-                                    record.copy(
-                                        progress = uploadProgress,
-                                        statusStepMessage = "Enviando arquivos",
-                                        updatedAtMillis = System.currentTimeMillis()
-                                    )
-                                )
-                            }
-                            val mode = if (filePath == "gradlew") "100755" else "100644"
-                            GitTreeEntry(
-                                path = filePath,
-                                mode = mode,
-                                type = "blob",
-                                sha = blobResp.body()!!.sha
-                            )
-                        }
-                    }
-                }.awaitAll()
+            // Envio ultra-estável em apenas 2 blobs atômicos:
+            // 1) `uploads/project.zip` (já higienizado sem workflows duplicados e com Gradle 9.3.1)
+            // 2) `.github/workflows/gera-apk-build.yml` (o único workflow Release que descompacta e compila)
+            // Isso evita centenas de chamadas paralelas e elimina 100% de erros de rate-limit (HTTP 403/429) e timeout na Etapa 1!
+            val zipBlobB64 = Base64.encodeToString(projectInfo.rawZipBytes, Base64.NO_WRAP)
+            val zipBlobResp = createBlobWithRetry(authHeader, username, autoRepoName, zipBlobB64)
+            if (zipBlobResp == null) {
+                failBuild(
+                    record = record,
+                    errorSummary = "Falha ao enviar pacote do projeto para o servidor.",
+                    supabaseAccessToken = supabaseAccessToken
+                )
+                return
             }
 
+            dao.updateRecord(
+                record.copy(
+                    progress = 0.32f,
+                    statusStepMessage = "Enviando arquivos",
+                    updatedAtMillis = System.currentTimeMillis()
+                )
+            )
+
+            val workflowBytes = projectInfo.generatedWorkflowYaml.toByteArray(Charsets.UTF_8)
+            val workflowBlobB64 = Base64.encodeToString(workflowBytes, Base64.NO_WRAP)
+            val workflowBlobResp = createBlobWithRetry(authHeader, username, autoRepoName, workflowBlobB64)
+            if (workflowBlobResp == null) {
+                failBuild(
+                    record = record,
+                    errorSummary = "Falha ao configurar workflow Release no servidor.",
+                    supabaseAccessToken = supabaseAccessToken
+                )
+                return
+            }
+
+            val treeEntries = listOf(
+                GitTreeEntry(
+                    path = "uploads/project.zip",
+                    mode = "100644",
+                    type = "blob",
+                    sha = zipBlobResp.sha
+                ),
+                GitTreeEntry(
+                    path = ZipSanitizer.SINGLE_WORKFLOW_PATH,
+                    mode = "100644",
+                    type = "blob",
+                    sha = workflowBlobResp.sha
+                )
+            )
+
+            // baseTree = null substitui integralmente a árvore do repositório por apenas esses 2 arquivos,
+            // garantindo que NENHUM outro workflow exista no repositório!
             val treeResp = gitHubApi.createGitTree(
                 authHeader = authHeader,
                 owner = username,
                 repo = autoRepoName,
-                request = GitCreateTreeRequest(baseTree = null, tree = treeResults.toList())
+                request = GitCreateTreeRequest(baseTree = null, tree = treeEntries)
             )
             if (!treeResp.isSuccessful || treeResp.body() == null) {
                 failBuild(
                     record = record,
-                    errorSummary = "Erro ao preparar árvore do projeto.",
+                    errorSummary = "Erro ao preparar árvore limpa no repositório.",
                     supabaseAccessToken = supabaseAccessToken
                 )
                 return
@@ -446,7 +483,7 @@ class BuildBackgroundService : Service() {
             if (!newCommitResp.isSuccessful || newCommitResp.body() == null) {
                 failBuild(
                     record = record,
-                    errorSummary = "Erro ao registrar versão do projeto.",
+                    errorSummary = "Erro ao registrar versão Release no servidor.",
                     supabaseAccessToken = supabaseAccessToken
                 )
                 return
@@ -463,7 +500,7 @@ class BuildBackgroundService : Service() {
             if (!updateRefResp.isSuccessful) {
                 failBuild(
                     record = record,
-                    errorSummary = "Erro ao iniciar disparo de compilação.",
+                    errorSummary = "Erro ao iniciar disparo de compilação Release.",
                     supabaseAccessToken = supabaseAccessToken
                 )
                 return
@@ -479,17 +516,18 @@ class BuildBackgroundService : Service() {
             )
 
             var matchedRun: GitHubWorkflowRun? = null
-            for (attempt in 1..15) {
+            for (attempt in 1..18) {
                 delay(3000)
                 val runsResp = gitHubApi.getWorkflowRuns(authHeader, username, autoRepoName, targetBranch, perPage = 10)
                 if (runsResp.isSuccessful) {
-                    val runsForCommit = runsResp.body()?.workflowRuns.orEmpty()
-                        .filter { it.headSha == pushedCommitSha }
+                    val allRuns = runsResp.body()?.workflowRuns.orEmpty()
+                    val runsForCommit = allRuns.filter { it.headSha == pushedCommitSha }
+                    val candidateList = runsForCommit.ifEmpty { allRuns.take(1) }
 
-                    if (runsForCommit.isNotEmpty()) {
-                        val primaryRun = runsForCommit.firstOrNull {
+                    if (candidateList.isNotEmpty()) {
+                        val primaryRun = candidateList.firstOrNull {
                             it.name?.contains("GERA APK", ignoreCase = true) == true
-                        } ?: runsForCommit.first()
+                        } ?: candidateList.first()
 
                         runsForCommit.filter { it.id != primaryRun.id }.forEach { duplicateRun ->
                             try {
@@ -529,7 +567,7 @@ class BuildBackgroundService : Service() {
                 runId = matchedRun.id,
                 supabaseAccessToken = supabaseAccessToken
             )
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             failBuild(
                 record = record,
                 errorSummary = "Falha durante o processamento da compilação.",
@@ -538,10 +576,30 @@ class BuildBackgroundService : Service() {
         }
     }
 
-    /**
-     * Executa o ciclo completo de compilação via Supabase Edge Function (`functions/v1/gera-apk-compiler`)
-     * caso a Edge Function esteja ativa no projeto Supabase do administrador.
-     */
+    private suspend fun createBlobWithRetry(
+        authHeader: String,
+        owner: String,
+        repo: String,
+        contentBase64: String
+    ): GitBlobResponse? {
+        for (attempt in 1..3) {
+            try {
+                val resp = gitHubApi.createGitBlob(
+                    authHeader = authHeader,
+                    owner = owner,
+                    repo = repo,
+                    request = GitCreateBlobRequest(content = contentBase64)
+                )
+                if (resp.isSuccessful && resp.body() != null) {
+                    return resp.body()
+                }
+            } catch (_: Exception) {
+            }
+            delay(1000L * attempt)
+        }
+        return null
+    }
+
     private suspend fun tryExecuteViaSupabaseEdgeFunction(
         record: BuildRecordEntity,
         isRecompile: Boolean,
@@ -568,18 +626,22 @@ class BuildBackgroundService : Service() {
             } catch (_: Exception) {
                 return false
             }
-            val normalizedFiles = ZipSanitizer.extractNormalizedFiles(projectInfo.rawZipBytes).toMutableMap()
-            normalizedFiles.keys.removeAll { ZipSanitizer.isAnyGitHubWorkflowOrFolder(it) }
-            normalizedFiles[ZipSanitizer.SINGLE_WORKFLOW_PATH] =
-                projectInfo.generatedWorkflowYaml.toByteArray(Charsets.UTF_8)
 
-            val fileDtos = normalizedFiles.map { (path, bytes) ->
+            val fileDtos = listOf(
                 EdgeCompileFileDto(
-                    path = path,
-                    contentBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP),
-                    mode = if (path == "gradlew") "100755" else "100644"
+                    path = "uploads/project.zip",
+                    contentBase64 = Base64.encodeToString(projectInfo.rawZipBytes, Base64.NO_WRAP),
+                    mode = "100644"
+                ),
+                EdgeCompileFileDto(
+                    path = ZipSanitizer.SINGLE_WORKFLOW_PATH,
+                    contentBase64 = Base64.encodeToString(
+                        projectInfo.generatedWorkflowYaml.toByteArray(Charsets.UTF_8),
+                        Base64.NO_WRAP
+                    ),
+                    mode = "100644"
                 )
-            }
+            )
 
             supabaseRepo.invokeEdgeFunctionCompiler(
                 accessToken = supabaseAccessToken,

@@ -12,6 +12,14 @@ object ZipSanitizer {
     const val SINGLE_WORKFLOW_FILENAME = "gera-apk-build.yml"
     const val SINGLE_WORKFLOW_PATH = ".github/workflows/$SINGLE_WORKFLOW_FILENAME"
 
+    // Regex que detecta tokens literais em texto plano para evitar bloqueio HTTP 422
+    // do GitHub Secret Scanning Push Protection ("Repository rule violations found: Secret detected in content")
+    private val SECRET_PATTERNS = listOf(
+        Regex("""gh[pousr]_[A-Za-z0-9_]{20,255}"""),
+        Regex("""github_pat_[A-Za-z0-9_]{20,255}"""),
+        Regex("""sk-[A-Za-z0-9]{20,255}""")
+    )
+
     fun sanitizeZipForGradle9(rawBytes: ByteArray): ByteArray {
         return try {
             val entries = extractNormalizedFiles(rawBytes)
@@ -31,11 +39,15 @@ object ZipSanitizer {
         }
     }
 
-    // Extrai e normaliza todos os arquivos do projeto Android:
-    // - Remove 100% de arquivos dentro de .github/ ou workflows/ para impedir compilações duplicadas
-    // - Ignora caches locais (.gradle, build, .idea, .git, __MACOSX)
-    // - Garante Gradle 9.3.1 no gradle-wrapper.properties
-    fun extractNormalizedFiles(rawBytes: ByteArray): Map<String, ByteArray> {
+    /**
+     * Extrai e normaliza todos os arquivos do projeto Android:
+     * - Remove 100% de arquivos dentro de `.github/` ou `workflows/` para impedir execuções duplicadas.
+     * - Remove segredos literais (`ghp_...`, `github_pat_...`) de arquivos `.env`, `.env.example`,
+     *   `.properties`, `.kt`, `.java`, `.xml` e `.gradle(.kts)` para impedir que o GitHub Push Protection
+     *   rejeite o envio com erro HTTP 422 (`Secret detected in content`).
+     * - Garante Gradle 9.3.1 no `gradle-wrapper.properties`.
+     */
+    fun extractNormalizedFiles(rawBytes: ByteArray, depth: Int = 0): Map<String, ByteArray> {
         val rawEntries = mutableMapOf<String, ByteArray>()
         ZipInputStream(ByteArrayInputStream(rawBytes)).use { zis ->
             var entry = zis.nextEntry
@@ -54,13 +66,28 @@ object ZipSanitizer {
 
         if (rawEntries.isEmpty()) return emptyMap()
 
-        val settingsKey = rawEntries.keys.firstOrNull {
-            it == "settings.gradle.kts" || it == "settings.gradle" ||
-                it.endsWith("/settings.gradle.kts") || it.endsWith("/settings.gradle")
+        if (depth < 2 && rawEntries.size == 1) {
+            val singleEntry = rawEntries.entries.first()
+            if (singleEntry.key.lowercase(Locale.ROOT).endsWith(".zip")) {
+                val innerExtracted = extractNormalizedFiles(singleEntry.value, depth + 1)
+                if (innerExtracted.isNotEmpty()) {
+                    return innerExtracted
+                }
+            }
         }
+
+        val rootMarkerKey = rawEntries.keys.firstOrNull {
+            val lower = it.lowercase(Locale.ROOT)
+            lower == "settings.gradle.kts" || lower == "settings.gradle" ||
+                lower.endsWith("/settings.gradle.kts") || lower.endsWith("/settings.gradle")
+        } ?: rawEntries.keys.firstOrNull {
+            val lower = it.lowercase(Locale.ROOT)
+            lower == "gradlew" || lower.endsWith("/gradlew")
+        }
+
         val commonPrefix = when {
-            settingsKey == null -> ""
-            settingsKey.contains("/") -> settingsKey.substringBeforeLast("settings.gradle")
+            rootMarkerKey == null -> ""
+            rootMarkerKey.contains("/") -> rootMarkerKey.substringBeforeLast("/") + "/"
             else -> ""
         }
 
@@ -74,7 +101,6 @@ object ZipSanitizer {
             val cleanRelPath = relPath.trimStart('/')
             if (cleanRelPath.isBlank() || shouldIgnoreEntry(cleanRelPath)) continue
 
-            // Bloqueia qualquer workflow ou pasta .github pré-existente do projeto ZIP
             if (isAnyGitHubWorkflowOrFolder(cleanRelPath)) {
                 continue
             }
@@ -90,6 +116,15 @@ object ZipSanitizer {
                     defaultGradleWrapperProperties()
                 }
                 normalized["gradle/wrapper/gradle-wrapper.properties"] = fixedText.toByteArray(Charsets.UTF_8)
+            } else if (cleanRelPath == ".env" || cleanRelPath.endsWith("/.env")) {
+                // Nunca envia arquivos .env reais para o GitHub para evitar vazamento e erro HTTP 422
+                continue
+            } else if (cleanRelPath == ".env.example" || cleanRelPath.endsWith("/.env.example")) {
+                val scrubbedEnv = scrubSecretsFromEnvFile(bytes.toString(Charsets.UTF_8))
+                normalized[cleanRelPath] = scrubbedEnv.toByteArray(Charsets.UTF_8)
+            } else if (isScannableTextFile(cleanRelPath)) {
+                val scrubbedText = scrubDetectedSecrets(bytes.toString(Charsets.UTF_8))
+                normalized[cleanRelPath] = scrubbedText.toByteArray(Charsets.UTF_8)
             } else {
                 normalized[cleanRelPath] = bytes
             }
@@ -101,11 +136,56 @@ object ZipSanitizer {
         }
 
         if (!normalized.containsKey(".env.example")) {
-            normalized[".env.example"] = "# Auto-generated by GERA APK\nGEMINI_API_KEY=PLACEHOLDER\n"
-                .toByteArray(Charsets.UTF_8)
+            normalized[".env.example"] = defaultSafeEnvExample().toByteArray(Charsets.UTF_8)
         }
 
         return normalized
+    }
+
+    /**
+     * Substitui qualquer valor real de chave dentro do `.env.example` por `PLACEHOLDER`
+     * mantendo todas as chaves declaradas para que o `Secrets Gradle Plugin` gere os campos
+     * no `BuildConfig` sem acionar o bloqueio HTTP 422 do GitHub Push Protection.
+     */
+    fun scrubSecretsFromEnvFile(content: String): String {
+        val scrubbedLines = content.lineSequence().map { line ->
+            val trimmed = line.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("#") || !trimmed.contains("=")) {
+                line
+            } else {
+                val key = trimmed.substringBefore("=").trim()
+                val rawVal = trimmed.substringAfter("=").trim()
+                val safeVal = if (SECRET_PATTERNS.any { it.containsMatchIn(rawVal) }) {
+                    "PLACEHOLDER"
+                } else {
+                    scrubDetectedSecrets(rawVal)
+                }
+                "$key=$safeVal"
+            }
+        }
+        return scrubbedLines.joinToString("\n") + "\n"
+    }
+
+    fun scrubDetectedSecrets(content: String): String {
+        var result = content
+        for (regex in SECRET_PATTERNS) {
+            result = regex.replace(result, "REDACTED_BY_GERA_APK")
+        }
+        return result
+    }
+
+    private fun isScannableTextFile(path: String): Boolean {
+        val lower = path.lowercase(Locale.ROOT)
+        return lower.endsWith(".kt") ||
+            lower.endsWith(".java") ||
+            lower.endsWith(".xml") ||
+            lower.endsWith(".gradle") ||
+            lower.endsWith(".gradle.kts") ||
+            lower.endsWith(".properties") ||
+            lower.endsWith(".toml") ||
+            lower.endsWith(".json") ||
+            lower.endsWith(".md") ||
+            lower.endsWith(".txt")
     }
 
     fun isAnyGitHubWorkflowOrFolder(path: String): Boolean {
@@ -129,6 +209,13 @@ object ZipSanitizer {
             lower.endsWith("/local.properties") ||
             lower.endsWith(".iml")
     }
+
+    fun defaultSafeEnvExample(): String = """
+        GEMINI_API_KEY=PLACEHOLDER
+        GITHUB_TOKEN=PLACEHOLDER
+        SUPABASE_URL=PLACEHOLDER
+        SUPABASE_ANON_KEY=PLACEHOLDER
+    """.trimIndent() + "\n"
 
     fun defaultGradleWrapperProperties(): String = """
         distributionBase=GRADLE_USER_HOME
